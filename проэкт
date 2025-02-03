@@ -1,0 +1,118 @@
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+import jwt
+import datetime
+import os
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://user:password@localhost/rezervaciju_db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = 'slepenaisatslegasvard'
+
+db = SQLAlchemy(app)
+
+# Lietotāju modelis
+class Lietotajs(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    vards = db.Column(db.String(100), nullable=False)
+    epasts = db.Column(db.String(100), unique=True, nullable=False)
+    parole_hash = db.Column(db.String(255), nullable=False)
+    loma = db.Column(db.String(20), nullable=False)
+
+# Resursu modelis
+class Resurss(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    nosaukums = db.Column(db.String(100), nullable=False)
+    tips = db.Column(db.String(50), nullable=False)
+    atrashanas_vieta = db.Column(db.String(255), nullable=False)
+    apraksts = db.Column(db.Text)
+
+# Rezervāciju modelis
+class Rezervacija(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    lietotaja_id = db.Column(db.Integer, db.ForeignKey('lietotajs.id'), nullable=False)
+    resursa_id = db.Column(db.Integer, db.ForeignKey('resurss.id'), nullable=False)
+    sakuma_laiks = db.Column(db.DateTime, nullable=False)
+    beigu_laiks = db.Column(db.DateTime, nullable=False)
+    statuss = db.Column(db.String(20), nullable=False, default='apstiprināts')
+
+# Dekorators autorizācijai
+def token_pieprasits(f):
+    @wraps(f)
+    def dekoracija(*args, **kwargs):
+        tokens = request.headers.get('x-access-token')
+        if not tokens:
+            return jsonify({'ziņa': 'Autorizācija nepieciešama!'}), 401
+        try:
+            dati = jwt.decode(tokens, app.config['SECRET_KEY'], algorithms=['HS256'])
+            pasreizejais_lietotajs = Lietotajs.query.filter_by(id=dati['id']).first()
+        except:
+            return jsonify({'ziņa': 'Nepareizs tokens!'}), 401
+        return f(pasreizejais_lietotajs, *args, **kwargs)
+    return dekoracija
+
+# Reģistrācija
+@app.route('/registre', methods=['POST'])
+def registre():
+    dati = request.json
+    parole_hash = generate_password_hash(dati['parole'], method='pbkdf2:sha256')
+    jauns_lietotajs = Lietotajs(vards=dati['vards'], epasts=dati['epasts'], parole_hash=parole_hash, loma='lietotajs')
+    db.session.add(jauns_lietotajs)
+    db.session.commit()
+    return jsonify({'ziņa': 'Reģistrācija veiksmīga'}), 201
+
+# Pieslēgšanās
+@app.route('/pieslegties', methods=['POST'])
+def pieslegties():
+    dati = request.json
+    lietotajs = Lietotajs.query.filter_by(epasts=dati['epasts']).first()
+    if lietotajs and check_password_hash(lietotajs.parole_hash, dati['parole']):
+        tokens = jwt.encode({'id': lietotajs.id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)}, app.config['SECRET_KEY'], algorithm='HS256')
+        return jsonify({'tokens': tokens})
+    return jsonify({'ziņa': 'Nepareizs e-pasts vai parole'}), 401
+
+# Pievienot resursu (tikai adminiem)
+@app.route('/resursi', methods=['POST'])
+@token_pieprasits
+def pievienot_resursu(pasreizejais_lietotajs):
+    if pasreizejais_lietotajs.loma != 'admin':
+        return jsonify({'ziņa': 'Nav tiesību pievienot resursus!'}), 403
+    dati = request.json
+    jauns_resurss = Resurss(nosaukums=dati['nosaukums'], tips=dati['tips'], atrashanas_vieta=dati['atrashanas_vieta'], apraksts=dati.get('apraksts'))
+    db.session.add(jauns_resurss)
+    db.session.commit()
+    return jsonify({'ziņa': 'Resurss pievienots'}), 201
+
+# Izveidot rezervāciju
+@app.route('/rezervacijas', methods=['POST'])
+@token_pieprasits
+def pievienot_rezervaciju(pasreizejais_lietotajs):
+    dati = request.json
+    jauna_rezervacija = Rezervacija(
+        lietotaja_id=pasreizejais_lietotajs.id,
+        resursa_id=dati['resursa_id'],
+        sakuma_laiks=dati['sakuma_laiks'],
+        beigu_laiks=dati['beigu_laiks']
+    )
+    db.session.add(jauna_rezervacija)
+    db.session.commit()
+    return jsonify({'ziņa': 'Rezervācija veiksmīgi izveidota'}), 201
+
+# Dzēst rezervāciju
+@app.route('/rezervacijas/<int:rezervacija_id>', methods=['DELETE'])
+@token_pieprasits
+def dzest_rezervaciju(pasreizejais_lietotajs, rezervacija_id):
+    rezervacija = Rezervacija.query.get(rezervacija_id)
+    if not rezervacija:
+        return jsonify({'ziņa': 'Rezervācija nav atrasta'}), 404
+    if pasreizejais_lietotajs.id != rezervacija.lietotaja_id and pasreizejais_lietotajs.loma != 'admin':
+        return jsonify({'ziņa': 'Nav tiesību dzēst šo rezervāciju!'}), 403
+    db.session.delete(rezervacija)
+    db.session.commit()
+    return jsonify({'ziņa': 'Rezervācija dzēsta'})
+
+if __name__ == '__main__':
+    db.create_all()
+    app.run(debug=True)
